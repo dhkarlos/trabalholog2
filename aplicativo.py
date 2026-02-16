@@ -1,6 +1,10 @@
 # app.py
 # Dashboard de Logística: Centralizado vs Descentralizado
-# SES (alpha por erro) + EOQ + ROP + Simulação (SimPy) + Plotly + (opcional) Monte Carlo
+# Inclui: SES (ajuste) + MAE/RMSE + EOQ (Q) + ROP (z) + Simulação (SimPy) + Plotly + (opcional) Monte Carlo
+#
+# CORREÇÕES IMPORTANTES:
+# 1) Evita st.cache_data retornando objetos não-serializáveis (cds do SimPy). Cacheia só DataFrames.
+# 2) Corrige f-string inválida no gráfico do SES.
 
 import math
 import numpy as np
@@ -10,20 +14,21 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 
+
 # =========================
 # Utilidades
 # =========================
 def set_seed(seed: int) -> None:
-    np.random.seed(seed)
+    np.random.seed(int(seed))
 
-def mae(y_true, y_pred):
+def mae(y_true, y_pred) -> float:
     y_true = pd.Series(y_true, dtype=float)
     y_pred = pd.Series(y_pred, dtype=float)
     if len(y_true) <= 1:
         return float("nan")
     return float((y_true.iloc[1:] - y_pred.iloc[1:]).abs().mean())
 
-def rmse(y_true, y_pred):
+def rmse(y_true, y_pred) -> float:
     y_true = pd.Series(y_true, dtype=float)
     y_pred = pd.Series(y_pred, dtype=float)
     if len(y_true) <= 1:
@@ -34,13 +39,13 @@ def ses_fitted_and_forecast(series, alpha: float):
     s = pd.Series(series, dtype=float).reset_index(drop=True)
     if len(s) < 2:
         raise ValueError("Série curta demais para SES (mín. 2 pontos).")
-    level = s.iloc[0]
+    level = float(s.iloc[0])
     fitted = [level]
     for t in range(1, len(s)):
-        level = alpha * s.iloc[t - 1] + (1 - alpha) * level
+        level = float(alpha) * float(s.iloc[t - 1]) + (1 - float(alpha)) * float(level)
         fitted.append(level)
     fitted = pd.Series(fitted, dtype=float)
-    forecast_next = alpha * s.iloc[-1] + (1 - alpha) * level
+    forecast_next = float(alpha) * float(s.iloc[-1]) + (1 - float(alpha)) * float(level)
     return fitted, float(forecast_next)
 
 def choose_alpha(series, alphas=None, criterio="MAE"):
@@ -48,27 +53,43 @@ def choose_alpha(series, alphas=None, criterio="MAE"):
         alphas = np.linspace(0.05, 0.95, 19)
 
     best = None
+    criterio = str(criterio).upper()
+
     for a in alphas:
-        fitted, fc = ses_fitted_and_forecast(series, a)
+        fitted, fc = ses_fitted_and_forecast(series, float(a))
         m = mae(series, fitted)
         r = rmse(series, fitted)
-        score = m if criterio.upper() == "MAE" else r
-        row = {"alpha": float(a), "MAE": float(m), "RMSE": float(r), "score": float(score),
-               "fitted": fitted, "forecast": float(fc)}
+        score = m if criterio == "MAE" else r
+        row = {
+            "alpha": float(a),
+            "MAE": float(m),
+            "RMSE": float(r),
+            "score": float(score),
+            "fitted": fitted,
+            "forecast": float(fc),
+        }
         if best is None or row["score"] < best["score"]:
             best = row
     return best
 
 def eoq(D_anual: float, S_pedido: float, H_anual: float) -> float:
+    D_anual = float(D_anual)
+    S_pedido = float(S_pedido)
+    H_anual = float(H_anual)
     if D_anual <= 0 or S_pedido <= 0 or H_anual <= 0:
         return 1.0
-    return math.sqrt((2 * D_anual * S_pedido) / H_anual)
+    return float(math.sqrt((2 * D_anual * S_pedido) / H_anual))
 
 def z_from_service_level(p: float) -> float:
-    # fallback simples: aproxima níveis comuns
-    tabela = {0.80: 0.842, 0.85: 1.036, 0.90: 1.282, 0.95: 1.645, 0.97: 1.881, 0.98: 2.054, 0.99: 2.326}
+    # Tabela de z para níveis comuns (suficiente para o projeto)
+    tabela = {
+        0.80: 0.842, 0.85: 1.036, 0.90: 1.282, 0.95: 1.645,
+        0.97: 1.881, 0.98: 2.054, 0.99: 2.326
+    }
+    p = float(p)
     ch = min(tabela.keys(), key=lambda k: abs(k - p))
     return float(tabela[ch])
+
 
 # =========================
 # Núcleo da simulação (SimPy)
@@ -76,7 +97,7 @@ def z_from_service_level(p: float) -> float:
 class CentroDistribuicao:
     def __init__(self, env: simpy.Environment, nome: str, p: dict):
         self.env = env
-        self.nome = nome
+        self.nome = str(nome)
         self.p = p
 
         self.estoque = float(p["estoque_inicial"])
@@ -89,7 +110,7 @@ class CentroDistribuicao:
         self.demanda_hist = []
         self.atendida_hist = []
         self.perdida_hist = []
-        self.pedidos_hist = []  # quant. pedido emitido no dia (0 ou Q)
+        self.pedidos_hist = []  # Q emitido no dia (0 ou Q)
 
         # custos
         self.custo_pedido = 0.0
@@ -99,25 +120,28 @@ class CentroDistribuicao:
 
         env.process(self.run())
 
-    def _calc_rop(self):
+    def _calc_rop(self) -> float:
         # ROP = mu*L + z*sqrt(L*sigma^2 + mu^2*sigmaL^2)
-        mu = self.p["demanda_media"]
-        sig = self.p["demanda_std"]
-        L = self.p["lead_time_media"]
-        sigL = self.p["lead_time_std"]
-        z = self.p["z"]
+        mu = float(self.p["demanda_media"])
+        sig = float(self.p["demanda_std"])
+        L = float(self.p["lead_time_media"])
+        sigL = float(self.p["lead_time_std"])
+        z = float(self.p["z"])
+
         demanda_LT = mu * L
         var = (L * (sig ** 2)) + ((mu ** 2) * (sigL ** 2))
-        return demanda_LT + z * math.sqrt(max(0.0, var))
+        return float(demanda_LT + z * math.sqrt(max(0.0, var)))
 
-    def _place_order(self, Q):
+    def _place_order(self, Q: float):
+        Q = float(Q)
         self.pipeline += 1
         self.on_order += Q
-        self.custo_pedido += self.p["custo_fixo_pedido"]
-        self.custo_frete += Q * self.p["custo_frete_unit"]
 
-        lead = np.random.normal(self.p["lead_time_media"], self.p["lead_time_std"])
-        lead = max(1, int(round(lead)))
+        self.custo_pedido += float(self.p["custo_fixo_pedido"])
+        self.custo_frete += Q * float(self.p["custo_frete_unit"])
+
+        lead = np.random.normal(float(self.p["lead_time_media"]), float(self.p["lead_time_std"]))
+        lead = max(1, int(round(float(lead))))
         yield self.env.timeout(lead)
 
         self.estoque += Q
@@ -128,51 +152,50 @@ class CentroDistribuicao:
         while True:
             dia = int(self.env.now)
             self.dias.append(dia)
-            self.estoque_hist.append(self.estoque)
+            self.estoque_hist.append(float(self.estoque))
 
-            # Demanda do dia
-            d = np.random.normal(self.p["demanda_media"], self.p["demanda_std"])
-            d = max(0, int(round(d)))
+            # demanda do dia
+            d = np.random.normal(float(self.p["demanda_media"]), float(self.p["demanda_std"]))
+            d = max(0, int(round(float(d))))
             self.demanda_hist.append(d)
 
-            vendido = min(self.estoque, d)
-            perdido = d - vendido
-            self.estoque -= vendido
+            vendido = min(float(self.estoque), float(d))
+            perdido = float(d) - float(vendido)
+            self.estoque -= float(vendido)
 
-            self.atendida_hist.append(vendido)
-            self.perdida_hist.append(perdido)
+            self.atendida_hist.append(float(vendido))
+            self.perdida_hist.append(float(perdido))
 
             # custos
-            self.custo_rupt += perdido * self.p["custo_ruptura_unit"]
-            self.custo_hold += self.estoque * (self.p["custo_hold_anual"] / 365.0)
+            self.custo_rupt += float(perdido) * float(self.p["custo_ruptura_unit"])
+            self.custo_hold += float(self.estoque) * (float(self.p["custo_hold_anual"]) / 365.0)
 
-            # Política: (s, Q) com posição de estoque
             rop = self._calc_rop()
-            posicao = self.estoque + self.on_order
+            posicao = float(self.estoque) + float(self.on_order)
 
             pedido_hoje = 0.0
             if posicao < rop and self.pipeline == 0:
-                Q = self.p["Q"]
+                Q = float(self.p["Q"])
                 pedido_hoje = Q
                 self.env.process(self._place_order(Q))
 
-            self.pedidos_hist.append(pedido_hoje)
+            self.pedidos_hist.append(float(pedido_hoje))
 
             yield self.env.timeout(1)
+
 
 def simular(params_por_cd: dict, dias: int, seed: int):
     set_seed(seed)
     env = simpy.Environment()
     cds = [CentroDistribuicao(env, nome, p) for nome, p in params_por_cd.items()]
-    env.run(until=dias)
+    env.run(until=int(dias))
 
     rows = []
     for cd in cds:
-        dem = sum(cd.demanda_hist)
-        atd = sum(cd.atendida_hist)
-        per = sum(cd.perdida_hist)
+        dem = float(np.sum(cd.demanda_hist))
+        atd = float(np.sum(cd.atendida_hist))
+        per = float(np.sum(cd.perdida_hist))
         fill_rate = atd / dem if dem > 0 else 1.0
-        # proxy: % dias sem ruptura
         csl_proxy = 1.0 - float(np.mean(np.array(cd.perdida_hist) > 0))
 
         custo_total = cd.custo_pedido + cd.custo_frete + cd.custo_hold + cd.custo_rupt
@@ -193,20 +216,22 @@ def simular(params_por_cd: dict, dias: int, seed: int):
     df = pd.DataFrame(rows)
     return df, cds
 
-def monte_carlo(params, dias, n_rep, seed0):
+
+def monte_carlo(params: dict, dias: int, n_rep: int, seed0: int):
     res = []
-    for k in range(n_rep):
-        df, _ = simular(params, dias=dias, seed=seed0 + k)
+    for k in range(int(n_rep)):
+        df, _ = simular(params, dias=int(dias), seed=int(seed0) + k)
         res.append({
-            "Custo_Total": df["Custo_Total"].sum(),
-            "FillRate": df["Atendida"].sum() / max(1, df["Demanda"].sum()),
-            "Perdida": df["Perdida"].sum(),
-            "Custo_Pedido": df["Custo_Pedido"].sum(),
-            "Custo_Frete": df["Custo_Frete"].sum(),
-            "Custo_Holding": df["Custo_Holding"].sum(),
-            "Custo_Ruptura": df["Custo_Ruptura"].sum(),
+            "Custo_Total": float(df["Custo_Total"].sum()),
+            "FillRate": float(df["Atendida"].sum() / max(1.0, float(df["Demanda"].sum()))),
+            "Perdida": float(df["Perdida"].sum()),
+            "Custo_Pedido": float(df["Custo_Pedido"].sum()),
+            "Custo_Frete": float(df["Custo_Frete"].sum()),
+            "Custo_Holding": float(df["Custo_Holding"].sum()),
+            "Custo_Ruptura": float(df["Custo_Ruptura"].sum()),
         })
     return pd.DataFrame(res)
+
 
 # =========================
 # Streamlit UI
@@ -214,7 +239,7 @@ def monte_carlo(params, dias, n_rep, seed0):
 st.set_page_config(page_title="Dashboard de Logística", layout="wide")
 
 st.title("📊 Dashboard de Logística: Centralizado vs. Descentralizado")
-st.caption("Painel com SES (ajuste), EOQ, ROP e simulação (SimPy) para 365 dias (ou conforme você definir).")
+st.caption("Painel com SES (ajuste), EOQ, ROP e simulação (SimPy). Ajuste os parâmetros na barra lateral.")
 
 # --- Sidebar: parâmetros
 st.sidebar.header("⚙️ Parâmetros da Simulação")
@@ -236,36 +261,35 @@ z = z_from_service_level(service_level)
 st.sidebar.write(f"Z aproximado: **{z:.3f}**")
 
 st.sidebar.subheader("Custos")
-S_PEDIDO = st.sidebar.number_input("Custo fixo por pedido (S)", value=150.0, step=10.0)
-H_ANUAL  = st.sidebar.number_input("Custo anual de holding por unidade (H)", value=5.0, step=0.5)
-C_RUPT   = st.sidebar.number_input("Penalidade por ruptura (por unidade)", value=20.0, step=1.0)
+S_PEDIDO = float(st.sidebar.number_input("Custo fixo por pedido (S)", value=150.0, step=10.0))
+H_ANUAL  = float(st.sidebar.number_input("Custo anual de holding por unidade (H)", value=5.0, step=0.5))
+C_RUPT   = float(st.sidebar.number_input("Penalidade por ruptura (por unidade)", value=20.0, step=1.0))
 
 st.sidebar.subheader("Fretes (por unidade)")
-frete_norte  = st.sidebar.number_input("Frete Norte (Desc)", value=2.50, step=0.10)
-frete_centro = st.sidebar.number_input("Frete Centro (Desc)", value=2.20, step=0.10)
-frete_sul    = st.sidebar.number_input("Frete Sul (Desc)", value=2.40, step=0.10)
-frete_central= st.sidebar.number_input("Frete Central (Cent)", value=2.80, step=0.10)
+frete_norte   = float(st.sidebar.number_input("Frete Norte (Desc)", value=2.50, step=0.10))
+frete_centro  = float(st.sidebar.number_input("Frete Centro (Desc)", value=2.20, step=0.10))
+frete_sul     = float(st.sidebar.number_input("Frete Sul (Desc)", value=2.40, step=0.10))
+frete_central = float(st.sidebar.number_input("Frete Central (Cent)", value=2.80, step=0.10))
 
 st.sidebar.subheader("Estoques iniciais")
-est_norte  = st.sidebar.number_input("Estoque inicial Norte", value=450, step=10)
-est_centro = st.sidebar.number_input("Estoque inicial Centro", value=500, step=10)
-est_sul    = st.sidebar.number_input("Estoque inicial Sul", value=420, step=10)
-est_central= st.sidebar.number_input("Estoque inicial Central", value=1200, step=10)
+est_norte   = float(st.sidebar.number_input("Estoque inicial Norte", value=450, step=10))
+est_centro  = float(st.sidebar.number_input("Estoque inicial Centro", value=500, step=10))
+est_sul     = float(st.sidebar.number_input("Estoque inicial Sul", value=420, step=10))
+est_central = float(st.sidebar.number_input("Estoque inicial Central", value=1200, step=10))
 
 st.sidebar.subheader("Monte Carlo (opcional)")
 do_mc = st.sidebar.checkbox("Rodar Monte Carlo", value=False)
 n_rep = st.sidebar.slider("Repetições", 20, 400, 120, 10)
 
-# --- Dados: histórico diário por região (upload)
+# --- Upload dados diários
 st.sidebar.header("📥 Dados (opcional)")
-st.sidebar.caption("Envie um CSV com colunas: date, Norte, Centro, Sul (valores diários).")
+st.sidebar.caption("Envie um CSV com colunas: date (opcional), Norte, Centro, Sul (valores diários).")
 up = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
-def carregar_series_diarias():
-    if up is None:
-        # fallback (use seus valores reais aqui se quiser)
-        # Você pode substituir por dados do seu projeto.
-        # Series sintéticas só para rodar sem upload.
+
+def carregar_series_diarias(uploaded_file):
+    if uploaded_file is None:
+        # fallback sintético só para o app rodar sem upload
         base = pd.date_range("2025-01-01", periods=120, freq="D")
         rng = np.random.default_rng(123)
         df = pd.DataFrame({
@@ -275,22 +299,34 @@ def carregar_series_diarias():
             "Sul":    rng.normal(3.0, 0.8, len(base)).clip(0).round().astype(int),
         })
         return df
-    df = pd.read_csv(up)
+
+    df = pd.read_csv(uploaded_file)
     if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-    # garante colunas
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
     for c in ["Norte", "Centro", "Sul"]:
         if c not in df.columns:
             raise ValueError(f"CSV precisa da coluna '{c}'.")
+
+    # limpa NaNs e garante numérico
+    for c in ["Norte", "Centro", "Sul"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Norte", "Centro", "Sul"]).reset_index(drop=True)
+
+    if len(df) < 10:
+        raise ValueError("CSV com poucos dias. Envie mais observações (>=10 recomendado).")
+
     return df
 
+
 try:
-    df_hist = carregar_series_diarias()
+    df_hist = carregar_series_diarias(up)
 except Exception as e:
     st.error(f"Erro ao carregar dados: {e}")
     st.stop()
 
-# --- SES por região
+
+# --- SES por região (diário)
 def parametros_regiao(reg_name: str, serie: pd.Series):
     best = choose_alpha(serie.values, criterio=criterio_alpha)
     mu = float(best["forecast"])  # diário
@@ -298,22 +334,22 @@ def parametros_regiao(reg_name: str, serie: pd.Series):
     sigma = float(best["RMSE"]) if criterio_alpha == "RMSE" else float(1.25 * best["MAE"])
     sigma *= float(sigma_mult)
     return {
-        "alpha": best["alpha"],
-        "MAE": best["MAE"],
-        "RMSE": best["RMSE"],
-        "mu": mu,
-        "sigma": sigma,
+        "alpha": float(best["alpha"]),
+        "MAE": float(best["MAE"]),
+        "RMSE": float(best["RMSE"]),
+        "mu": float(mu),
+        "sigma": float(sigma),
         "fitted": best["fitted"],
-        "forecast": best["forecast"],
+        "forecast": float(best["forecast"]),
     }
 
-reg_data = {}
-for reg in ["Norte", "Centro", "Sul"]:
-    reg_data[reg] = parametros_regiao(reg, df_hist[reg])
 
-# --- EOQ/Q por CD (usa demanda anual estimada)
+reg_data = {reg: parametros_regiao(reg, df_hist[reg]) for reg in ["Norte", "Centro", "Sul"]}
+
+
+# --- EOQ/Q por CD (demanda anual estimada)
 def Q_from_mu(mu_diario: float):
-    D = mu_diario * 365.0
+    D = float(mu_diario) * 365.0
     return float(eoq(D, S_PEDIDO, H_ANUAL))
 
 Q_norte  = Q_from_mu(reg_data["Norte"]["mu"])
@@ -324,8 +360,9 @@ mu_ag = reg_data["Norte"]["mu"] + reg_data["Centro"]["mu"] + reg_data["Sul"]["mu
 sig_ag = math.sqrt(reg_data["Norte"]["sigma"]**2 + reg_data["Centro"]["sigma"]**2 + reg_data["Sul"]["sigma"]**2)
 Q_ag = Q_from_mu(mu_ag)
 
-# --- montar params
+
 def params_cd(mu, sigma, Q, estoque_ini, frete_unit):
+    # Tudo float puro para facilitar hash/cache e evitar tipos numpy
     return {
         "demanda_media": float(mu),
         "demanda_std": float(sigma),
@@ -349,15 +386,24 @@ params_cent = {
     "Centralizado (Agregado)": params_cd(mu_ag, sig_ag, Q_ag, est_central, frete_central)
 }
 
-# --- Rodar simulações (cache leve por parâmetros principais)
-@st.cache_data(show_spinner=False)
-def run_once(params_desc, params_cent, dias, seed):
-    df_desc, cds_desc = simular(params_desc, dias=dias, seed=seed)
-    df_cent, cds_cent = simular(params_cent, dias=dias, seed=seed)
-    return df_desc, cds_desc, df_cent, cds_cent
 
+# =========================
+# Cache (CORRIGIDO): cacheia só DataFrames (serializáveis)
+# =========================
+@st.cache_data(show_spinner=False)
+def run_dfs(params_desc, params_cent, dias, seed):
+    df_desc, _ = simular(params_desc, dias=int(dias), seed=int(seed))
+    df_cent, _ = simular(params_cent, dias=int(dias), seed=int(seed))
+    return df_desc, df_cent
+
+# pega dataframes via cache
 with st.spinner("Rodando simulação..."):
-    df_desc, cds_desc, df_cent, cds_cent = run_once(params_desc, params_cent, dias, seed)
+    df_desc, df_cent = run_dfs(params_desc, params_cent, dias, seed)
+
+# pega séries (cds) SEM cache (para gráfico de estoque)
+_, cds_desc = simular(params_desc, dias=int(dias), seed=int(seed))
+_, cds_cent = simular(params_cent, dias=int(dias), seed=int(seed))
+
 
 # =========================
 # Layout principal
@@ -366,6 +412,7 @@ colA, colB = st.columns([2, 1], gap="large")
 
 with colB:
     st.subheader("📌 Resumo (Etapa 1)")
+
     resumo = pd.DataFrame([{
         "Região": r,
         "alpha": reg_data[r]["alpha"],
@@ -375,36 +422,40 @@ with colB:
         "sigma (usada)": reg_data[r]["sigma"],
         "Q (EOQ)": Q_from_mu(reg_data[r]["mu"]),
     } for r in ["Norte", "Centro", "Sul"]])
+
     st.dataframe(resumo, use_container_width=True, hide_index=True)
 
     st.markdown("**Centralizado (agregado)**")
     st.write({
-        "mu_agregado": round(mu_ag, 3),
-        "sigma_agregado": round(sig_ag, 3),
-        "Q_agregado": round(Q_ag, 1),
+        "mu_agregado": round(mu_ag, 4),
+        "sigma_agregado": round(sig_ag, 4),
+        "Q_agregado": round(Q_ag, 2),
         "z": round(z, 3),
+        "service_level_aprox": service_level,
     })
 
 with colA:
     st.subheader("1) Evolução do Estoque: Comparativo Diário")
 
-    # gráfico único: centralizado + 3 regiões (desc)
     fig_stock = go.Figure()
 
     # centralizado
     ccent = cds_cent[0]
     fig_stock.add_trace(go.Scatter(
-        x=ccent.dias, y=ccent.estoque_hist, mode="lines",
+        x=ccent.dias,
+        y=ccent.estoque_hist,
+        mode="lines",
         name="Centralizado (Agregado)",
         hovertemplate="Dia=%{x}<br>Estoque=%{y:.0f}<extra></extra>"
     ))
 
-    # descentralizado (3 CDs)
-    # ordenar para ficar como legenda "Centro, Norte, Sul"
+    # descentralizado (ordenado)
     for name in ["Centro (Desc)", "Norte (Desc)", "Sul (Desc)"]:
         cd = next(x for x in cds_desc if x.nome == name)
         fig_stock.add_trace(go.Scatter(
-            x=cd.dias, y=cd.estoque_hist, mode="lines",
+            x=cd.dias,
+            y=cd.estoque_hist,
+            mode="lines",
             name=name,
             hovertemplate="Dia=%{x}<br>Estoque=%{y:.0f}<extra></extra>"
         ))
@@ -420,22 +471,19 @@ with colA:
 
 st.divider()
 
+
 # =========================
 # Resultados financeiros + serviço
 # =========================
 st.subheader("2) Resultado Financeiro e Nível de Serviço")
 
 def resumo_cenario(df):
-    dem = df["Demanda"].sum()
-    atd = df["Atendida"].sum()
-    per = df["Perdida"].sum()
-    fill = atd / max(1, dem)
-    custo = df["Custo_Total"].sum()
-    rupt_dias_proxy = None
-    return {
-        "Demanda": dem, "Atendida": atd, "Perdida": per,
-        "FillRate": fill, "CustoTotal": custo
-    }
+    dem = float(df["Demanda"].sum())
+    atd = float(df["Atendida"].sum())
+    per = float(df["Perdida"].sum())
+    fill = atd / max(1.0, dem)
+    custo = float(df["Custo_Total"].sum())
+    return {"Demanda": dem, "Atendida": atd, "Perdida": per, "FillRate": fill, "CustoTotal": custo}
 
 r_desc = resumo_cenario(df_desc)
 r_cent = resumo_cenario(df_cent)
@@ -481,10 +529,11 @@ with col2:
 
 st.divider()
 
+
 # =========================
 # Etapa 1: gráfico SES por região (todas)
 # =========================
-st.subheader("3) Ajuste SES (Etapa 1): Real vs Ajuste vs Forecast (por região)")
+st.subheader("3) Ajuste SES (Etapa 1): Real vs Ajuste vs Forecast (todas as regiões)")
 
 fig_ses = go.Figure()
 for reg in ["Norte","Centro","Sul"]:
@@ -494,14 +543,19 @@ for reg in ["Norte","Centro","Sul"]:
     a = reg_data[reg]["alpha"]
     m = reg_data[reg]["MAE"]
     r = reg_data[reg]["RMSE"]
+    erro_val = m if criterio_alpha == "MAE" else r
 
     x = list(range(1, len(serie)+1))
+
     fig_ses.add_trace(go.Scatter(x=x, y=serie, mode="lines", name=f"{reg} - Real"))
     fig_ses.add_trace(go.Scatter(
         x=x, y=fitted, mode="lines",
-        name=f"{reg} - SES (α={a:.2f}, {criterio_alpha}={m:.2f if criterio_alpha=='MAE' else r:.2f})"
+        name=f"{reg} - SES (α={a:.2f}, {criterio_alpha}={erro_val:.2f})"
     ))
-    fig_ses.add_trace(go.Scatter(x=[len(serie)+1], y=[fc], mode="markers", name=f"{reg} - Forecast"))
+    fig_ses.add_trace(go.Scatter(
+        x=[len(serie)+1], y=[fc], mode="markers",
+        name=f"{reg} - Forecast"
+    ))
 
 fig_ses.update_layout(
     height=420,
@@ -512,6 +566,7 @@ fig_ses.update_layout(
 )
 st.plotly_chart(fig_ses, use_container_width=True)
 
+
 # =========================
 # Monte Carlo (opcional)
 # =========================
@@ -519,9 +574,15 @@ if do_mc:
     st.divider()
     st.subheader("4) Monte Carlo (robustez): Distribuição de custo e serviço")
 
+    # cache do MC (só DataFrames)
+    @st.cache_data(show_spinner=False)
+    def run_mc(params_desc, params_cent, dias, n_rep, seed):
+        mc_desc = monte_carlo(params_desc, dias=int(dias), n_rep=int(n_rep), seed0=int(seed)*100 + 1)
+        mc_cent = monte_carlo(params_cent, dias=int(dias), n_rep=int(n_rep), seed0=int(seed)*100 + 2)
+        return mc_desc, mc_cent
+
     with st.spinner("Rodando Monte Carlo..."):
-        mc_desc = monte_carlo(params_desc, dias=dias, n_rep=n_rep, seed0=seed*100 + 1)
-        mc_cent = monte_carlo(params_cent, dias=dias, n_rep=n_rep, seed0=seed*100 + 2)
+        mc_desc, mc_cent = run_mc(params_desc, params_cent, dias, n_rep, seed)
 
     df_mc = pd.DataFrame({
         "Custo_Total": pd.concat([mc_desc["Custo_Total"], mc_cent["Custo_Total"]], ignore_index=True),
@@ -531,17 +592,23 @@ if do_mc:
 
     cL, cR = st.columns(2, gap="large")
     with cL:
-        fig_cost = px.histogram(df_mc, x="Custo_Total", color="Cenário", nbins=40, barmode="overlay", marginal="box",
-                                title="Distribuição do custo total (MC)")
+        fig_cost = px.histogram(
+            df_mc, x="Custo_Total", color="Cenário", nbins=40,
+            barmode="overlay", marginal="box",
+            title="Distribuição do custo total (Monte Carlo)"
+        )
         fig_cost.update_layout(height=420, margin=dict(l=10,r=10,t=50,b=10))
         st.plotly_chart(fig_cost, use_container_width=True)
 
     with cR:
-        fig_fill = px.histogram(df_mc, x="FillRate", color="Cenário", nbins=35, barmode="overlay", marginal="box",
-                                title="Distribuição do Fill Rate (MC)")
+        fig_fill = px.histogram(
+            df_mc, x="FillRate", color="Cenário", nbins=35,
+            barmode="overlay", marginal="box",
+            title="Distribuição do Fill Rate (Monte Carlo)"
+        )
         fig_fill.update_layout(height=420, margin=dict(l=10,r=10,t=50,b=10))
         st.plotly_chart(fig_fill, use_container_width=True)
 
-    st.caption("Dica: use a mediana e o p95 de custo para falar de risco; use o FillRate médio e p5 para serviço.")
+    st.caption("Dica: cite mediana/p95 de custo (risco) e média/p5 do FillRate (serviço).")
 
-st.success("✅ Pronto. Ajuste os sliders à esquerda e observe como custo e serviço mudam.")
+st.success("✅ Dashboard carregado. Ajuste os sliders à esquerda e observe custo/serviço/estoque.")
